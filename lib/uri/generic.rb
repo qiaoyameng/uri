@@ -58,6 +58,10 @@ module URI
       self::COMPONENT
     end
 
+    # Matches a serialized host carrying an RFC 6874 zone identifier:
+    # "[<IPv6address>%25<ZoneID>]".
+    ZONE_ID_HOST_PATTERN = /\A\[(?<address>[^%\[\]]++)%25(?<zone_id>[^\[\]]++)\]\z/ # :nodoc:
+
     USE_REGISTRY = false # :nodoc:
 
     def self.use_registry # :nodoc:
@@ -113,7 +117,23 @@ module URI
     # opaque, query, and fragment. You can provide arguments either by an Array or a Hash.
     # See ::new for hash keys to use or for order of array items.
     #
+    # A Hash may additionally carry a +:zone_id+ entry next to +:host+;
+    # the host is then composed from the bare IPv6 address and the zone
+    # identifier following the explicitly supported RFC 6874
+    # representation, e.g.:
+    #
+    #   URI::HTTP.build(scheme: 'http', host: 'fe80::1', zone_id: 'eth0')
+    #   #=> #<URI::HTTP http://[fe80::1%25eth0]>
+    #
     def self.build(args)
+      parser = nil
+      if args.kind_of?(Hash) && args.key?(:zone_id)
+        args = args.dup
+        zone_id = args.delete(:zone_id)
+        args[:host] = compose_host_with_zone_id(args[:host], zone_id)
+        parser = rfc6874_parser
+      end
+
       if args.kind_of?(Array) &&
           args.size == ::URI::Generic::COMPONENT.size
         tmp = args.dup
@@ -131,10 +151,40 @@ module URI
               "expected Array of or Hash of components of #{self} (#{component.join(', ')})"
       end
 
-      tmp << nil
+      tmp << parser
       tmp << true
       return self.new(*tmp)
     end
+
+    # Composes a serialized host of the form "[<addr>%25<zone>]" from a
+    # bare IPv6 +address+ and a separate +zone_id+, as explicitly
+    # specified by RFC 6874.
+    #
+    # The zone identifier is percent-encoded so that brackets, port
+    # separators and percent signs contained in it cannot escape the
+    # host component.  The address itself is validated against the
+    # RFC 6874 host grammar when the components are checked, so a zone
+    # identifier cannot be attached to a non-IPv6 host.
+    def self.compose_host_with_zone_id(address, zone_id) # :nodoc:
+      unless address.kind_of?(String) && zone_id.kind_of?(String)
+        raise InvalidComponentError,
+          "bad component(expected String address and zone_id): #{address.inspect}, #{zone_id.inspect}"
+      end
+      if zone_id.empty?
+        raise InvalidComponentError,
+          "bad component(empty zone identifier)"
+      end
+      address = address[1..-2] if address.start_with?('[') && address.end_with?(']')
+      escaped_zone = URI::RFC2396_PARSER.escape(zone_id, /[^A-Za-z0-9\-._~]/)
+      "[#{address}%25#{escaped_zone}]"
+    end
+    private_class_method :compose_host_with_zone_id
+
+    # Parser instance used to validate hosts composed with a zone id.
+    def self.rfc6874_parser # :nodoc:
+      @rfc6874_parser ||= RFC3986_Parser.new(rfc6874: true)
+    end
+    private_class_method :rfc6874_parser
 
     #
     # == Args
@@ -660,6 +710,7 @@ module URI
     #
     # This method is the same as URI::Generic#host except
     # brackets for IPv6 (and future IP) addresses are removed.
+    # Any RFC 6874 zone identifier is removed as well; see #zone_id.
     #
     #   uri = URI("http://[::1]/bar")
     #   uri.hostname      #=> "::1"
@@ -667,7 +718,53 @@ module URI
     #
     def hostname
       v = self.host
-      v&.start_with?('[') && v.end_with?(']') ? v[1..-2] : v
+      if v&.start_with?('[') && v.end_with?(']')
+        v = v[1..-2]
+        if i = v.index('%25'.freeze)
+          v = v[0, i]
+        end
+        v
+      else
+        v
+      end
+    end
+
+    # Returns the zone identifier of the host as a decoded String, or nil
+    # if the host carries none.
+    #
+    # This library explicitly supports the RFC 6874 representation
+    # "[<address>%25<zone>]": the percent sign introducing the zone is
+    # decoded exactly once here, and the case of interface names is
+    # preserved.  Parsing such URIs requires the optional RFC 6874
+    # compatibility mode; see URI::RFC3986_Parser.
+    #
+    #   uri = URI::RFC3986_Parser.new(rfc6874: true).parse("http://[fe80::1%25eth0]/")
+    #   uri.host        #=> "[fe80::1%25eth0]"
+    #   uri.hostname    #=> "fe80::1"
+    #   uri.zone_id     #=> "eth0"
+    #
+    def zone_id
+      if @host && (m = ZONE_ID_HOST_PATTERN.match(@host))
+        URI.decode_uri_component(m[:zone_id])
+      end
+    end
+
+    # Returns the host in the explicit "scoped" form
+    # "<address>%<zone_id>" expected by socket APIs such as
+    # TCPSocket.open, e.g. "fe80::1%eth0".  This is a pure string
+    # composition from #hostname and #zone_id: no network interfaces are
+    # queried and no DNS requests are made.  Without a zone identifier
+    # this is the same as #hostname.
+    #
+    #   uri = URI::RFC3986_Parser.new(rfc6874: true).parse("http://[fe80::1%25eth0]/")
+    #   uri.scoped_host #=> "fe80::1%eth0"
+    #
+    def scoped_host
+      if (zone = zone_id)
+        "#{hostname}%#{zone}"
+      else
+        hostname
+      end
     end
 
     # Sets the host part of the URI as the argument with brackets for IPv6 addresses.
@@ -1356,8 +1453,16 @@ module URI
       if scheme && scheme != scheme.downcase
         set_scheme(self.scheme.downcase)
       end
-      if host && host != host.downcase
-        set_host(self.host.downcase)
+      if host
+        if (m = ZONE_ID_HOST_PATTERN.match(host))
+          # RFC 6874: only the address is case-normalized.  Zone
+          # identifiers are case-sensitive, so hosts with different
+          # zones are never merged by normalization.
+          normalized_host = "[#{m[:address].downcase}%25#{m[:zone_id]}]"
+          set_host(normalized_host) if normalized_host != host
+        elsif host != host.downcase
+          set_host(self.host.downcase)
+        end
       end
     end
 

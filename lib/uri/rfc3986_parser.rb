@@ -1,12 +1,10 @@
 # frozen_string_literal: true
 module URI
   class RFC3986_Parser # :nodoc:
-    # URI defined in RFC3986
-    HOST = %r[
-      (?<IP-literal>\[(?:
-          (?<IPv6address>
-            (?:\h{1,4}:){6}
-            (?<ls32>\h{1,4}:\h{1,4}
+    # IPv6address production of RFC 3986, shared by HOST and HOST_RFC6874.
+    IPV6ADDRESS = %r[
+        (?:\h{1,4}:){6}
+        (?<ls32>\h{1,4}:\h{1,4}
             | (?<IPv4address>(?<dec-octet>[1-9]\d|1\d{2}|2[0-4]\d|25[0-5]|\d)
                 \.\g<dec-octet>\.\g<dec-octet>\.\g<dec-octet>)
             )
@@ -16,9 +14,31 @@ module URI
           | (?:(?:\h{1,4}:){,2}\h{1,4})?::(?:\h{1,4}:){2}\g<ls32>
           | (?:(?:\h{1,4}:){,3}\h{1,4})?::\h{1,4}:\g<ls32>
           | (?:(?:\h{1,4}:){,4}\h{1,4})?::\g<ls32>
-          | (?:(?:\h{1,4}:){,5}\h{1,4})?::\h{1,4}
-          | (?:(?:\h{1,4}:){,6}\h{1,4})?::
-          )
+      | (?:(?:\h{1,4}:){,5}\h{1,4})?::\h{1,4}
+      | (?:(?:\h{1,4}:){,6}\h{1,4})?::
+    ]x
+
+    # URI defined in RFC3986
+    HOST = %r[
+      (?<IP-literal>\[(?:
+          (?<IPv6address>#{IPV6ADDRESS.source})
+        | (?<IPvFuture>v\h++\.[!$&-.0-9:;=A-Z_a-z~]++)
+        )\])
+    | \g<IPv4address>
+    | (?<reg-name>(?:%\h\h|[!$&-.0-9;=A-Z_a-z~])*+)
+    ]x
+
+    # A single ZoneID atom of RFC 6874: unreserved / pct-encoded.
+    # Quantified at the use site (ZoneID = 1*( unreserved / pct-encoded )).
+    ZONE_ID = %r[(?:%\h\h|[0-9A-Za-z._~-])].source
+
+    # HOST extended with explicit support for the RFC 6874 zone identifier
+    # syntax: "[" IPv6address "%25" ZoneID "]".  This representation is
+    # only accepted when the optional +rfc6874+ compatibility mode is
+    # enabled; see #initialize.
+    HOST_RFC6874 = %r[
+      (?<IP-literal>\[(?:
+          (?<IPv6address>#{IPV6ADDRESS.source})(?:%25(?<ZoneID>#{ZONE_ID})+)?
         | (?<IPvFuture>v\h++\.[!$&-.0-9:;=A-Z_a-z~]++)
         )\])
     | \g<IPv4address>
@@ -32,46 +52,81 @@ module URI
     SEG_NC = %r[(?:%\h\h|[!$&-.0-9;=@A-Z_a-z~])].source
     FRAGMENT = %r[(?:%\h\h|[!$&-.0-9:;=@A-Z_a-z~/?])*+].source
 
-    RFC3986_URI = %r[\A
-    (?<seg>#{SEG}){0}
-    (?<URI>
-      (?<scheme>#{SCHEME}):
-      (?<hier-part>//
-        (?<authority>
-          (?:(?<userinfo>#{USERINFO.source})@)?
-          (?<host>#{HOST.source.delete(" \n")})
-          (?::(?<port>\d*+))?
+    # Builds the URI and relative-ref regexps from the given host pattern
+    # source (with insignificant whitespace already stripped).
+    def self.compile_uri_regexps(host_src) # :nodoc:
+      uri = %r[\A
+      (?<seg>#{SEG}){0}
+      (?<URI>
+        (?<scheme>#{SCHEME}):
+        (?<hier-part>//
+          (?<authority>
+            (?:(?<userinfo>#{USERINFO.source})@)?
+            (?<host>#{host_src})
+            (?::(?<port>\d*+))?
+          )
+          (?<path-abempty>(?:/\g<seg>*+)?)
+        | (?<path-absolute>/((?!/)\g<seg>++)?)
+        | (?<path-rootless>(?!/)\g<seg>++)
+        | (?<path-empty>)
         )
-        (?<path-abempty>(?:/\g<seg>*+)?)
-      | (?<path-absolute>/((?!/)\g<seg>++)?)
-      | (?<path-rootless>(?!/)\g<seg>++)
-      | (?<path-empty>)
-      )
-      (?:\?(?<query>[^\#]*+))?
-      (?:\#(?<fragment>#{FRAGMENT}))?
-    )\z]x
+        (?:\?(?<query>[^\#]*+))?
+        (?:\#(?<fragment>#{FRAGMENT}))?
+      )\z]x
 
-    RFC3986_relative_ref = %r[\A
-    (?<seg>#{SEG}){0}
-    (?<relative-ref>
-      (?<relative-part>//
-        (?<authority>
-          (?:(?<userinfo>#{USERINFO.source})@)?
-          (?<host>#{HOST.source.delete(" \n")}(?<!/))?
-          (?::(?<port>\d*+))?
+      relative_ref = %r[\A
+      (?<seg>#{SEG}){0}
+      (?<relative-ref>
+        (?<relative-part>//
+          (?<authority>
+            (?:(?<userinfo>#{USERINFO.source})@)?
+            (?<host>#{host_src}(?<!/))?
+            (?::(?<port>\d*+))?
+          )
+          (?<path-abempty>(?:/\g<seg>*+)?)
+        | (?<path-absolute>/\g<seg>*+)
+        | (?<path-noscheme>#{SEG_NC}++(?:/\g<seg>*+)?)
+        | (?<path-empty>)
         )
-        (?<path-abempty>(?:/\g<seg>*+)?)
-      | (?<path-absolute>/\g<seg>*+)
-      | (?<path-noscheme>#{SEG_NC}++(?:/\g<seg>*+)?)
-      | (?<path-empty>)
-      )
-      (?:\?(?<query>[^#]*+))?
-      (?:\#(?<fragment>#{FRAGMENT}))?
-    )\z]x
+        (?:\?(?<query>[^#]*+))?
+        (?:\#(?<fragment>#{FRAGMENT}))?
+      )\z]x
+
+      [uri, relative_ref]
+    end
+
+    RFC3986_URI, RFC3986_relative_ref =
+      compile_uri_regexps(HOST.source.delete(" \n"))
+
+    private_class_method :compile_uri_regexps
+
     attr_reader :regexp
 
-    def initialize
-      @regexp = default_regexp.each_value(&:freeze).freeze
+    # Creates a new parser.
+    #
+    # If the optional +rfc6874+ compatibility mode is enabled, this parser
+    # explicitly accepts RFC 6874 zone identifiers in IP-literal hosts,
+    # e.g. "http://[fe80::1%25eth0]/".  The mode is off by default, in
+    # which case such URIs are strictly rejected.  Parsing is a pure
+    # string operation in both modes: it never resolves interface names
+    # and never performs DNS lookups.
+    def initialize(rfc6874: false)
+      @rfc6874 = rfc6874
+      if rfc6874
+        @uri_regexp, @relative_ref_regexp =
+          self.class.send(:compile_uri_regexps, HOST_RFC6874.source.delete(" \n"))
+        host = HOST_RFC6874
+      else
+        @uri_regexp = RFC3986_URI
+        @relative_ref_regexp = RFC3986_relative_ref
+        host = HOST
+      end
+      @regexp = default_regexp(host).each_value(&:freeze).freeze
+    end
+
+    # Whether this parser accepts RFC 6874 zone identifiers.
+    def rfc6874?
+      @rfc6874
     end
 
     def split(uri) #:nodoc:
@@ -82,7 +137,7 @@ module URI
       end
       uri.ascii_only? or
         raise InvalidURIError, "URI must be ascii only #{uri.dump}"
-      if m = RFC3986_URI.match(uri)
+      if m = @uri_regexp.match(uri)
         query = m["query"]
         scheme = m["scheme"]
         opaque = m["path-rootless"]
@@ -112,7 +167,7 @@ module URI
             m["fragment"]
           ]
         end
-      elsif m = RFC3986_relative_ref.match(uri)
+      elsif m = @relative_ref_regexp.match(uri)
         [ nil, # scheme
           m["userinfo"],
           m["host"],
@@ -177,11 +232,11 @@ module URI
 
     private
 
-    def default_regexp # :nodoc:
+    def default_regexp(host = HOST) # :nodoc:
       {
         SCHEME: %r[\A#{SCHEME}\z]o,
         USERINFO: %r[\A#{USERINFO}\z]o,
-        HOST: %r[\A#{HOST}\z]o,
+        HOST: %r[\A#{host}\z],
         ABS_PATH: %r[\A/#{SEG}*+\z]o,
         REL_PATH: %r[\A(?!/)#{SEG}++\z]o,
         QUERY: %r[\A(?:%\h\h|[!$&-.0-9:;=@A-Z_a-z~/?])*+\z],
