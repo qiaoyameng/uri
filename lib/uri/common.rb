@@ -25,6 +25,15 @@ module URI
   DEFAULT_PARSER = RFC3986_PARSER
   Ractor.make_shareable(DEFAULT_PARSER) if defined?(Ractor)
 
+  # A parser instance which explicitly supports scoped IPv6 addresses
+  # with zone identifiers as defined by
+  # {RFC 6874}[https://www.rfc-editor.org/rfc/rfc6874.html], for example
+  # "http://[fe80::1%25eth0]/".  The default parser (RFC 3986 strict)
+  # rejects such URIs; use this constant, or pass a parser constructed
+  # with RFC3986_Parser.new(rfc6874: true), to opt in.
+  RFC6874_PARSER = RFC3986_Parser.new(rfc6874: true)
+  Ractor.make_shareable(RFC6874_PARSER) if defined?(Ractor)
+
   # Set the default parser instance.
   def self.parser=(parser = RFC3986_PARSER)
     remove_const(:Parser) if defined?(::URI::Parser)
@@ -243,8 +252,11 @@ module URI
   # It's recommended to first URI::RFC2396_PARSER.escape string +uri+
   # if it may contain invalid URI characters.
   #
-  def self.parse(uri)
-    PARSER.parse(uri)
+  # +parser+ defaults to the strict RFC 3986 parser.  Pass
+  # URI::RFC6874_PARSER to explicitly accept the RFC 6874 representation
+  # of scoped IPv6 addresses (e.g. "http://[fe80::1%25eth0]/").
+  def self.parse(uri, parser: PARSER)
+    parser.parse(uri)
   end
 
   # Merges the given URI strings +str+

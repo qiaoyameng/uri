@@ -133,7 +133,11 @@ module URI
 
       tmp << nil
       tmp << true
-      return self.new(*tmp)
+      zone = args.kind_of?(Hash) ? args[:zone] : nil
+      if zone
+        return self.new(*tmp, zone: zone)
+      end
+      self.new(*tmp)
     end
 
     #
@@ -172,11 +176,13 @@ module URI
                    query,
                    fragment,
                    parser = DEFAULT_PARSER,
-                   arg_check = false)
+                   arg_check = false,
+                   zone: nil)
       @scheme = nil
       @user = nil
       @password = nil
       @host = nil
+      @zone = nil
       @port = nil
       @path = nil
       @query = nil
@@ -187,6 +193,7 @@ module URI
       if arg_check
         self.scheme = scheme
         self.hostname = host
+        self.zone = zone unless zone.nil?
         self.port = port
         self.userinfo = userinfo
         self.path = path
@@ -195,7 +202,7 @@ module URI
         self.fragment = fragment
       else
         self.set_scheme(scheme)
-        self.set_host(host)
+        self.set_host(host, zone)
         self.set_port(port)
         self.set_userinfo(userinfo)
         self.set_path(path)
@@ -240,7 +247,16 @@ module URI
     #   URI("http://[::1]/bar/baz").host     #=> "[::1]"
     #   URI("http://[::1]/bar/baz").hostname #=> "::1"
     #
-    attr_reader :host
+    # When the URI is a scoped IPv6 address as defined by
+    # {RFC 6874}[https://www.rfc-editor.org/rfc/rfc6874.html], the host
+    # is returned in URI serialized form with a percent-encoded zone
+    # identifier; see #zone and #scoped_hostname.
+    #
+    #   URI::RFC6874_PARSER.parse("http://[fe80::1%25eth0]/").host #=> "[fe80::1%25eth0]"
+    #
+    def host
+      @host && @zone ? compose_ipv6_host : @host
+    end
 
     # Returns the port component of the URI.
     #
@@ -304,6 +320,7 @@ module URI
       component.each do |c|
         self.__send__("#{c}=", oth.__send__(c))
       end
+      @zone = oth.zone
     end
     private :replace!
 
@@ -577,7 +594,7 @@ module URI
     # Returns the authority info (array of user, password, host and
     # port), if any is set.  Or returns +nil+.
     def authority
-      return @user, @password, @host, @port if @user || @password || @host || @port
+      return @user, @password, self.host, @port if @user || @password || @host || @port
     end
 
     # Returns the user component after URI decoding.
@@ -612,12 +629,105 @@ module URI
     end
     private :check_host
 
+    # Pattern of a scoped IPv6 IP-literal as serialized in a URI,
+    # i.e. the RFC 6874 form "[addr%25zone]".
+    IPV6_SCOPED_HOST = %r[\A
+      \[
+      (?<addr>#{RFC3986_Parser::IPV6ADDR.source.delete(" \n")})
+      %25
+      (?<zone>#{RFC3986_Parser::ZONE_ID.source.delete(" \n")})
+      \]
+    \z]x
+    private_constant :IPV6_SCOPED_HOST
+
+    # Pattern of a bare (bracket-less) IPv6 address.
+    IPV6_HOST = %r[\A#{RFC3986_Parser::IPV6ADDR.source.delete(" \n")}\z]x
+    private_constant :IPV6_HOST
+
+    # Splits an RFC 6874 serialized IP-literal into the bracket-less IPv6
+    # address and the once-percent-decoded zone identifier.
+    # Returns [host_without_zone, decoded_zone_or_nil].  An embedded
+    # zone is accepted only when the parser explicitly supports the
+    # RFC 6874 representation.
+    def split_ipv6_zone(v)
+      if v && (m = IPV6_SCOPED_HOST.match(v))
+        unless parser.respond_to?(:rfc6874?) && parser.rfc6874?
+          raise InvalidComponentError,
+            "IPv6 zone identifier is not accepted by this parser " \
+            "(RFC 6874 support is disabled): #{v.inspect}"
+        end
+        addr = "[#{m[:addr]}]"
+        zone = URI.decode_uri_component(m[:zone])
+        check_zone(zone, addr)
+        [addr, zone]
+      else
+        [v, nil]
+      end
+    end
+    private :split_ipv6_zone
+
+    # Validates a decoded zone identifier and raises unless +host+ is a
+    # bracketed IPv6 address.  The zone is arbitrary text: structural
+    # characters are harmless here because they are percent-encoded when
+    # the zone is serialized, but an empty zone is rejected.
+    def check_zone(zone, host = @host)
+      if zone.nil?
+        return zone
+      end
+      unless host && host.start_with?('[') && host.end_with?(']') &&
+             IPV6_HOST.match?(host[1...-1])
+        raise InvalidComponentError,
+          "zone identifier is only allowed with an IPv6 host: #{host.inspect}"
+      end
+      if zone.empty?
+        raise InvalidComponentError,
+          "empty IPv6 zone identifier in host component: #{host.inspect}"
+      end
+      zone
+    end
+    private :check_zone
+
+    # Percent-encodes a decoded zone identifier for URI serialization.
+    # Only RFC 3986 unreserved characters pass through untouched, so a
+    # zone can never inject brackets, colons, a percent delimiter or any
+    # other component delimiter into the serialized host.
+    def encode_zone(zone)
+      zone.gsub(/[^A-Za-z0-9\-._~]/) do |ch|
+        ch.bytes.map { |byte| format('%%%02X', byte) }.join
+      end
+    end
+    private :encode_zone
+
+    # Rebuilds the serialized host from @host and @zone.
+    def compose_ipv6_host
+      if @zone
+        "#{@host[0...-1]}%25#{encode_zone(@zone)}]"
+      else
+        @host
+      end
+    end
+    private :compose_ipv6_host
+
     # Protected setter for the host component +v+.
     #
     # See also URI::Generic.host=.
     #
-    def set_host(v)
+    # +v+ is the host as serialized in a URI (IPv6 addresses are wrapped
+    # with brackets and may carry an RFC 6874 "%25zone").  When +zone+
+    # is given, it is stored separately as the decoded zone identifier
+    # and takes precedence over a zone embedded in +v+.  Setting the
+    # host to +nil+ also clears any zone identifier.
+    def set_host(v, zone = nil)
+      if v.nil?
+        @host = nil
+        @zone = nil
+        check_zone(zone) unless zone.nil?
+        return
+      end
+      v, decoded_zone = split_ipv6_zone(v)
       @host = v
+      @zone = zone || decoded_zone
+      check_zone(@zone) unless zone.nil? || decoded_zone
     end
     protected :set_host
 
@@ -625,7 +735,8 @@ module URI
     # and +port+).  If +port+ is +nil+, +default_port+ will be set.
     #
     protected def set_authority(user, password, host, port = nil)
-      @user, @password, @host, @port = user, password, host, port || self.default_port
+      set_host(host)
+      @user, @password, @port = user, password, port || self.default_port
     end
 
     #
@@ -651,9 +762,48 @@ module URI
     #
     def host=(v)
       check_host(v)
-      set_host(v)
+      set_host(v, nil)
       set_userinfo(nil)
       v
+    end
+
+    # Returns the decoded RFC 6874 zone identifier (such as an interface
+    # name) of an IPv6 host, or +nil+ when the host has no zone.
+    #
+    # The zone is kept separate from #host (the host used for URI
+    # serialization) and #hostname (the bracket-less IPv6 address), and
+    # its case is preserved.  This is the explicit representation of
+    # scoped IPv6 addresses defined by
+    # {RFC 6874}[https://www.rfc-editor.org/rfc/rfc6874.html].
+    #
+    #   URI::RFC6874_PARSER.parse("http://[fe80::1%25eth0]/").zone #=> "eth0"
+    #
+    attr_reader :zone
+
+    # Sets the decoded RFC 6874 zone identifier of an IPv6 host.
+    # Pass +nil+ to remove the zone.
+    #
+    # The host must already be an IPv6 address; the zone is kept as a
+    # separate component and percent-encoded during URI serialization,
+    # so brackets, port separators and percent signs in +v+ cannot break
+    # out of the host component.  An empty zone is rejected.
+    def zone=(v)
+      check_zone(v)
+      @zone = v
+      v
+    end
+
+    # Returns the host in the form expected by socket calls: the
+    # bracket-less IPv6 address followed by a literal percent sign and
+    # the decoded zone identifier (for example "fe80::1%eth0").
+    #
+    # Unlike #host this form must not be used for URI serialization.
+    # Returns +nil+ when there is no host, and is identical to
+    # #hostname for a host without a zone.
+    def scoped_hostname
+      return nil unless @host
+      base = @host.start_with?('[') && @host.end_with?(']') ? @host[1...-1] : @host
+      @zone ? "#{base}%#{@zone}" : base
     end
 
     # Extract the host part of the URI and unwrap brackets for IPv6 addresses.
@@ -666,8 +816,8 @@ module URI
     #   uri.host          #=> "[::1]"
     #
     def hostname
-      v = self.host
-      v&.start_with?('[') && v.end_with?(']') ? v[1..-2] : v
+      return nil unless @host
+      @host.start_with?('[') && @host.end_with?(']') ? @host[1...-1] : @host
     end
 
     # Sets the host part of the URI as the argument with brackets for IPv6 addresses.
@@ -1235,7 +1385,7 @@ module URI
                              self.query, self.fragment, parser)
 
       if rel.userinfo != oth.userinfo ||
-          rel.host.to_s.downcase != oth.host.to_s.downcase ||
+          !same_host?(rel, oth) ||
           rel.port != oth.port
 
         if self.userinfo.nil? && self.host.nil?
@@ -1356,10 +1506,33 @@ module URI
       if scheme && scheme != scheme.downcase
         set_scheme(self.scheme.downcase)
       end
-      if host && host != host.downcase
-        set_host(self.host.downcase)
+      normalize_host!
+    end
+
+    # Downcases the host without touching the zone identifier: an IPv6
+    # address's hex digits are case-insensitive, but a zone identifier
+    # (typically an interface name) is case-sensitive, so two addresses
+    # differing only in zone case must not be merged.
+    def normalize_host!
+      return unless @host
+      if @host.start_with?('[') && @host.end_with?(']')
+        addr = @host[1...-1]
+        if addr != addr.downcase
+          set_host("[#{addr.downcase}]", @zone)
+        end
+      elsif @host != @host.downcase
+        set_host(@host.downcase, nil)
       end
     end
+    private :normalize_host!
+
+    # Hosts are equal for reference resolution only when their addresses
+    # match case-insensitively and their (case-sensitive) zones match.
+    def same_host?(a, b)
+      a.hostname.to_s.downcase == b.hostname.to_s.downcase &&
+        a.zone == b.zone
+    end
+    private :same_host?
 
     #
     # Constructs String from URI.
@@ -1382,7 +1555,7 @@ module URI
           str << '@'
         end
         if @host
-          str << @host
+          str << self.host
         end
         if @port && @port != self.default_port
           str << ':'

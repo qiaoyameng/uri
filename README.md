@@ -44,6 +44,33 @@ uri.fragment  #=> "time=1305298413"
 uri.to_s      #=> "http://foo.com/posts?id=30&limit=5#time=1305298413"
 ```
 
+### Scoped IPv6 addresses (RFC 6874)
+
+URIs of scoped (link-local) IPv6 addresses carry a zone identifier such
+as an interface name, represented as `http://[fe80::1%25eth0]/` per
+[RFC 6874](https://www.rfc-editor.org/rfc/rfc6874).  This representation
+is not part of strict RFC 3986, so it is supported through an opt-in
+parser:
+
+```ruby
+uri = URI.parse("http://[fe80::1%25eth0]/", parser: URI::RFC6874_PARSER)
+uri.host             #=> "[fe80::1%25eth0]" # host used for URI serialization
+uri.hostname         #=> "fe80::1"         # bracket-less IPv6 address
+uri.zone             #=> "eth0"            # decoded zone identifier
+uri.scoped_hostname  #=> "fe80::1%eth0"    # form suitable for socket calls
+```
+
+The address and zone can also be supplied separately to a constructor:
+
+```ruby
+URI::HTTP.build(host: "[fe80::1]", zone: "eth0").to_s
+#=> "http://[fe80::1%25eth0]"
+```
+
+Parsing never queries network interfaces or performs DNS resolution, and
+the default parser keeps rejecting this form unless RFC 6874 support is
+enabled.
+
 ## Development
 
 After checking out the repo, run `bin/setup` to install dependencies. Then, run `rake test` to run the tests. You can also run `bin/console` for an interactive prompt that will allow you to experiment.

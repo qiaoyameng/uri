@@ -136,12 +136,13 @@ module URI
                    query,
                    fragment,
                    parser = nil,
-                   arg_check = false)
+                   arg_check = false,
+                   **kw)
       raise InvalidURIError unless path
       path = path.sub(/^\//,'')
       path.sub!(/^%2F/,'/')
       super(scheme, userinfo, host, port, registry, path, opaque,
-            query, fragment, parser, arg_check)
+            query, fragment, parser, arg_check, **kw)
       @typecode = nil
       if tmp = @path.index(TYPECODE_PREFIX)
         typecode = @path[tmp + TYPECODE_PREFIX.size..-1]

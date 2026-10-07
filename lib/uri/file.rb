@@ -59,9 +59,17 @@ module URI
     #
     # See also URI::Generic.host=.
     #
-    def set_host(v)
-      v = "" if v.nil? || v == "localhost"
-      @host = v
+    def set_host(v, zone = nil)
+      if v.nil?
+        @host = ""
+        @zone = nil
+        check_zone(zone) unless zone.nil?
+        return
+      end
+      v, decoded_zone = split_ipv6_zone(v)
+      @host = v == "localhost" ? "" : v
+      @zone = zone || decoded_zone
+      check_zone(@zone) unless @zone.nil?
     end
 
     # do nothing

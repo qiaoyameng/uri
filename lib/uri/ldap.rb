@@ -105,8 +105,8 @@ module URI
     #
     # See also URI::Generic.new.
     #
-    def initialize(*arg)
-      super(*arg)
+    def initialize(*arg, **kw)
+      super(*arg, **kw)
 
       if @fragment
         raise InvalidURIError, 'bad LDAP URL'

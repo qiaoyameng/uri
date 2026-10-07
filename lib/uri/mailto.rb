@@ -129,8 +129,8 @@ module URI
     # This method is usually called from URI::parse, which checks
     # the validity of each component.
     #
-    def initialize(*arg)
-      super(*arg)
+    def initialize(*arg, **kw)
+      super(*arg, **kw)
 
       @to = nil
       @headers = []
