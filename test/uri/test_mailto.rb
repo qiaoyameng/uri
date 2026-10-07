@@ -251,6 +251,171 @@ class URI::TestMailTo < Test::Unit::TestCase
     u = URI.parse('mailto:ruby-list@ruby-lang.org?Subject=subscribe&cc=myaddr')
     assert_equal "To: ruby-list@ruby-lang.org\nSubject: subscribe\nCc: myaddr\n\n\n",
       u.to_mailtext
+
+    u = URI.parse('mailto:user+label@example.com?subject=hello+world')
+    assert_equal "To: user+label@example.com\nSubject: hello+world\n\n\n",
+      u.to_mailtext
+  end
+
+  def test_compose_fields
+    uri = URI.parse(
+      "mailto:user+label@example.com,second@example.com" \
+      "?to=third+label@example.com,fourth@example.com" \
+      "&Subject=Re%3A%20hello+world" \
+      "&body=line%20one%0D%0AIn-Reply-To%3A%20not-a-header"
+    )
+
+    fields = uri.compose_fields(["Subject"])
+
+    assert_equal(
+      [
+        "user+label@example.com",
+        "second@example.com",
+        "third+label@example.com",
+        "fourth@example.com",
+      ],
+      fields[:to]
+    )
+    assert_equal({"Subject" => "Re: hello+world"}, fields[:headers])
+    assert_equal("line one\r\nIn-Reply-To: not-a-header", fields[:body])
+    assert_empty(fields[:headers].keys - ["Subject"])
+  end
+
+  def test_compose_fields_headers_are_case_insensitive
+    uri = URI.parse("mailto:user@example.com?Subject=first&sUbJeCt=second")
+
+    fields = uri.compose_fields(["Subject"], duplicate_headers: :first)
+    assert_equal({"Subject" => "first"}, fields[:headers])
+
+    fields = uri.compose_fields(["Subject"], duplicate_headers: :last)
+    assert_equal({"Subject" => "second"}, fields[:headers])
+
+    fields = uri.compose_fields(["Subject"], duplicate_headers: :join)
+    assert_equal({"Subject" => "first, second"}, fields[:headers])
+  end
+
+  def test_compose_fields_duplicate_header_policy
+    uri = URI.parse("mailto:user@example.com?X-Test=one&x-test=two")
+
+    assert_raise(URI::InvalidComponentError) do
+      uri.compose_fields(["X-Test"])
+    end
+
+    fields = uri.compose_fields(["X-Test"]) do |name, values|
+      assert_equal("x-test", name)
+      values.join(";")
+    end
+    assert_equal({"X-Test" => "one;two"}, fields[:headers])
+  end
+
+  def test_compose_fields_rejects_unallowed_headers_by_default
+    uri = URI.parse("mailto:user@example.com?subject=hello&cc=other@example.com")
+
+    error = assert_raise(URI::InvalidComponentError) do
+      uri.compose_fields
+    end
+    assert_match(/subject/, error.message)
+
+    assert_raise(URI::InvalidComponentError) do
+      uri.compose_fields(["subject"])
+    end
+  end
+
+  def test_compose_fields_rejects_encoded_colon_in_header_name
+    uri = URI.parse("mailto:user@example.com?sub%3Aject=value")
+
+    assert_raise(URI::InvalidComponentError) do
+      uri.compose_fields(["subject"])
+    end
+
+    uri = URI.parse("mailto:user@example.com?body%3A=not-the-body")
+    assert_raise(URI::InvalidComponentError) do
+      uri.compose_fields
+    end
+  end
+
+  def test_compose_fields_rejects_decoded_line_breaks_outside_body
+    uri = URI.parse("mailto:user@example.com?subject=hello%0D%0AEvil:%20value")
+
+    assert_raise(URI::InvalidComponentError) do
+      uri.compose_fields(["subject"])
+    end
+
+    uri = URI.parse("mailto:user@example.com?sub%0D%0Aject=value")
+    assert_raise(URI::InvalidComponentError) do
+      uri.compose_fields(["subject"])
+    end
+
+    uri = URI.parse("mailto:user%0D%0A@example.com")
+    assert_raise(URI::InvalidComponentError) do
+      uri.compose_fields
+    end
+  end
+
+  def test_compose_fields_does_not_decode_twice
+    uri = URI.parse(
+      "mailto:user@example.com" \
+      "?body=safe%250d%250aIn-Reply-To%253A%2520not-a-header"
+    )
+
+    fields = uri.compose_fields
+
+    assert_equal("safe%0d%0aIn-Reply-To%3A%20not-a-header", fields[:body])
+    assert_empty(fields[:headers])
+
+    uri = URI.parse("mailto:user@example.com?subject=safe%250d%250a")
+    fields = uri.compose_fields(["Subject"])
+    assert_equal({"Subject" => "safe%0d%0a"}, fields[:headers])
+  end
+
+  def test_compose_fields_ignores_empty_to_fields
+    uri = URI.parse("mailto:?to=&to=user@example.com")
+    fields = uri.compose_fields
+    assert_equal(["user@example.com"], fields[:to])
+  end
+
+  def test_compose_fields_rejects_unknown_duplicate_policy
+    uri = URI.parse("mailto:user@example.com?subject=one&subject=two")
+
+    assert_raise(ArgumentError) do
+      uri.compose_fields(["subject"], duplicate_headers: :unknown)
+    end
+  end
+
+  def test_compose_fields_duplicate_body_policy
+    uri = URI.parse("mailto:user@example.com?body=one&body=two&body=three")
+
+    assert_raise(URI::InvalidComponentError) do
+      uri.compose_fields
+    end
+    assert_equal(
+      "three",
+      uri.compose_fields(nil, duplicate_headers: :last)[:body]
+    )
+    assert_equal(
+      "one;two;three",
+      uri.compose_fields do |_name, values|
+        values.join(";")
+      end[:body]
+    )
+  end
+
+  def test_compose_fields_result_does_not_alias_uri
+    source = "mailto:user+label@example.com?Subject=hello+world"
+    uri = URI.parse(source)
+    fields = uri.compose_fields(["Subject"])
+
+    fields[:to].first << " changed"
+    fields[:to] << "changed@example.com"
+    fields[:headers]["Subject"] << " changed"
+    fields[:body] = "changed"
+
+    assert_equal(source, uri.to_s)
+    assert_equal(
+      ["user+label@example.com"],
+      uri.compose_fields(["Subject"])[:to]
+    )
+    assert_equal([["Subject", "hello+world"]], uri.headers)
   end
 
   def test_select

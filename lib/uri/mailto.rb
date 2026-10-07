@@ -165,6 +165,98 @@ module URI
     # E-mail headers set by the URL, as an Array of Arrays.
     attr_reader :headers
 
+    # Returns structured mailto fields suitable for confirmation before
+    # creating a message.
+    #
+    # +allowed_headers+ is the case-insensitive list of header field names
+    # that may be returned.  The reserved +to+ and +body+ fields are handled
+    # separately.  +duplicate_headers+ selects how repeated header fields are
+    # combined:
+    #
+    # - +:raise+ (the default): raise URI::InvalidComponentError.
+    # - +:first+: keep the first value.
+    # - +:last+: keep the last value.
+    # - +:join+: combine values with <code>", "</code>.
+    # - a callable: call it with the lowercase field name and values.
+    #
+    # Fields are decoded using RFC 6068 percent-encoding, so +"+"+ remains a
+    # literal plus sign.  CR and LF are rejected in addresses, header names,
+    # and ordinary header values, while decoded newlines in +body+ are
+    # preserved.
+    def compose_fields(allowed_headers = nil,
+                       duplicate_headers: :raise,
+                       on_duplicate: duplicate_headers,
+                       &duplicate_handler)
+      on_duplicate = duplicate_handler if duplicate_handler
+      allowed = Array(allowed_headers).map do |name|
+        [name.to_s.downcase, name.to_s]
+      end.to_h
+
+      result = {
+        to: [],
+        headers: {},
+        body: nil,
+      }
+      header_values = {}
+      body_values = []
+      validate_duplicate_header_policy(on_duplicate)
+
+      add_addresses = ->(encoded) do
+        encoded.split(',').each do |part|
+          address = decode_mailto_component(part)
+          reject_mail_line_break(address, "address")
+          result[:to] << address unless address.empty?
+        end
+      end
+
+      (@to || '').split(/[,;]/).each do |encoded|
+        address = decode_mailto_component(encoded)
+        reject_mail_line_break(address, "address")
+        result[:to] << address unless address.empty?
+      end
+
+      @headers.each do |encoded_name, encoded_value|
+        name = decode_mailto_component(encoded_name || '')
+        reject_mail_line_break(name, "header name")
+        value = decode_mailto_component(encoded_value || '')
+        field_name = name.downcase
+
+        case field_name
+        when 'to'
+          add_addresses.call(value)
+        when 'body'
+          body_values << value
+        else
+          unless allowed.include?(field_name)
+            raise InvalidComponentError,
+              "header field #{name.dump} is not allowed"
+          end
+
+          reject_mail_line_break(value, "header value")
+          (header_values[field_name] ||= []) << value
+        end
+      end
+
+      header_values.each do |field_name, values|
+        if values.size == 1
+          result[:headers][allowed[field_name]] = values.first
+        else
+          result[:headers][allowed[field_name]] =
+            resolve_duplicate_header(field_name, values, on_duplicate)
+        end
+      end
+
+      if body_values.size > 1
+        result[:body] = resolve_duplicate_header(
+          'body', body_values, on_duplicate
+        )
+      else
+        result[:body] = body_values.first
+      end
+
+      result
+    end
+
     # Checks the to +v+ component.
     def check_to(v)
       return true unless v
@@ -266,18 +358,18 @@ module URI
     #   # => "To: ruby-list@ruby-lang.org\nSubject: subscribe\nCc: myaddr\n\n\n"
     #
     def to_mailtext
-      to = URI.decode_www_form_component(@to)
+      to = URI.decode_uri_component(@to)
       head = ''
       body = ''
       @headers.each do |x|
         case x[0]
         when 'body'
-          body = URI.decode_www_form_component(x[1])
+          body = URI.decode_uri_component(x[1])
         when 'to'
-          to << ', ' + URI.decode_www_form_component(x[1])
+          to << ', ' + URI.decode_uri_component(x[1])
         else
-          head << URI.decode_www_form_component(x[0]).capitalize + ': ' +
-            URI.decode_www_form_component(x[1])  + "\n"
+          head << URI.decode_uri_component(x[0]).capitalize + ': ' +
+            URI.decode_uri_component(x[1])  + "\n"
         end
       end
 
@@ -287,6 +379,49 @@ module URI
 "
     end
     alias to_rfc822text to_mailtext
+
+    def decode_mailto_component(component)
+      URI.decode_uri_component(component)
+    rescue ArgumentError
+      raise InvalidComponentError,
+        "invalid percent-encoding in mailto component: #{component.dump}"
+    end
+    private :decode_mailto_component
+
+    def reject_mail_line_break(value, description)
+      if /[\r\n]/.match?(value)
+        raise InvalidComponentError,
+          "CR/LF is not allowed in mailto #{description}: #{value.dump}"
+      end
+    end
+    private :reject_mail_line_break
+
+    def validate_duplicate_header_policy(policy)
+      return if [:raise, :first, :last, :join].include?(policy)
+      return if policy.respond_to?(:call)
+
+      raise ArgumentError,
+        "unsupported duplicate header policy: #{policy.inspect}"
+    end
+    private :validate_duplicate_header_policy
+
+    def resolve_duplicate_header(name, values, policy)
+      case policy
+      when :raise
+        raise InvalidComponentError,
+          "duplicate mailto header field #{name.dump}"
+      when :first
+        values.first
+      when :last
+        values.last
+      when :join
+        values.join(', ')
+      else
+        policy.call(name, values)
+      end
+    end
+    private :resolve_duplicate_header
+
   end
 
   register_scheme 'MAILTO', MailTo
