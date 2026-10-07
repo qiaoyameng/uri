@@ -255,6 +255,83 @@ module URI
         end
     end
 
+    # Returns the decoded mailto fields without creating or sending a message.
+    #
+    # The returned Hash contains:
+    #
+    # +:to+:: An Array of recipient mailboxes, in the order in which they
+    #         appeared in the URI.
+    # +:headers+:: An Array of +[field_name, field_value]+ pairs for the
+    #              case-insensitive field names included in
+    #              +allowed_headers+.
+    # +:body+:: The decoded message body, or an empty String.
+    #
+    # Only +to+ and +body+ are recognized without being listed in
+    # +allowed_headers+. Percent-decoding follows RFC 6068, so a literal
+    # <tt>'+'</tt> is preserved instead of being converted to a space.
+    #
+    # Repeated +to+ fields are merged into the recipient Array. Repeated
+    # occurrences of another header are handled with +duplicate_headers+.
+    # The default policy, +:raise+, rejects duplicates. Other built-in
+    # policies are +:first+, +:last+, +:all+, +:array+, and +:join+. A
+    # callable may also be supplied; it receives the field name and an
+    # Array of values and should return a String or an Array of Strings.
+    #
+    # CR and LF are rejected in recipient addresses and ordinary header
+    # fields, while line breaks in +body+ are retained. This method does
+    # not mutate the URI.
+    def compose_fields(allowed_header_list = nil,
+                       allowed_headers: nil,
+                       duplicate_headers: :raise,
+                       &duplicate_header_policy)
+      permitted_header_names =
+        permitted_header_names(allowed_header_list || allowed_headers)
+      duplicate_policy = duplicate_header_policy || duplicate_headers
+
+      recipients = []
+      body_values = []
+      header_entries = []
+      header_entry_by_name = {}
+
+      add_recipients(@to, recipients)
+
+      @headers.each do |encoded_name, encoded_value|
+        name = decode_mailto_component(encoded_name)
+        value = decode_mailto_component(encoded_value.to_s)
+        normalized_name = name.downcase
+
+        case normalized_name
+        when 'to'
+          add_recipients(encoded_value, recipients)
+        when 'body'
+          body_values << value
+        else
+          unless permitted_header_names.include?(normalized_name)
+            raise InvalidComponentError,
+              "header #{name.dump} is not allowed"
+          end
+          reject_header_line_break('header field name', name)
+          reject_header_line_break(name, value)
+
+          entry = header_entry_by_name[normalized_name]
+          unless entry
+            entry = { name: name, values: [] }
+            header_entry_by_name[normalized_name] = entry
+            header_entries << entry
+          end
+          entry[:values] << value
+        end
+      end
+
+      headers = header_entries.flat_map do |entry|
+        resolve_duplicate_header(entry[:name], entry[:values],
+                                 duplicate_policy)
+      end
+      body = resolve_duplicate_body(body_values, duplicate_policy)
+
+      { to: recipients, headers: headers, body: body }
+    end
+
     # Returns the RFC822 e-mail text equivalent of the URL, as a String.
     #
     # Example:
@@ -287,6 +364,139 @@ module URI
 "
     end
     alias to_rfc822text to_mailtext
+
+    def permitted_header_names(headers)
+      headers = [headers] if headers.is_a?(String) || headers.is_a?(Symbol)
+      unless headers.nil? || headers.is_a?(Array)
+        raise ArgumentError, 'allowed headers must be an Array, String, or Symbol'
+      end
+
+      (headers || []).map do |name|
+        name = name.to_s
+        if name.match?(/[\r\n]/)
+          raise InvalidComponentError,
+            "CR/LF is not allowed in allowed header field name: #{name.dump}"
+        end
+        name.downcase
+      end
+    end
+    private :permitted_header_names
+
+    def decode_mailto_component(component)
+      URI.decode_uri_component(component)
+    rescue ArgumentError
+      raise InvalidComponentError,
+        "invalid percent-encoding in mailto component: #{component.dump}"
+    end
+    private :decode_mailto_component
+
+    def add_recipients(encoded_recipients, recipients)
+      encoded_recipients.to_s.split(/[,;]/).each do |encoded_recipient|
+        recipient = decode_mailto_component(encoded_recipient)
+        next if recipient.empty?
+
+        reject_header_line_break('to', recipient)
+        check_mailbox(recipient)
+        recipients << recipient
+      end
+    end
+    private :add_recipients
+
+    def check_mailbox(mailbox)
+      address = mailbox
+      if mailbox.end_with?('>')
+        less_than = mailbox.index('<')
+        unless less_than
+          raise InvalidComponentError,
+            "an address in 'to' is invalid: #{mailbox.dump}"
+        end
+
+        address = mailbox[(less_than + 1)...-1]
+      end
+
+      unless EMAIL_REGEXP.match?(address)
+        raise InvalidComponentError,
+          "an address in 'to' is invalid: #{mailbox.dump}"
+      end
+    end
+    private :check_mailbox
+
+    def reject_header_line_break(name, value)
+      if value.match?(/[\r\n]/)
+        raise InvalidComponentError,
+          "CR/LF is not allowed in #{name.dump}"
+      end
+      value
+    end
+    private :reject_header_line_break
+
+    def normalize_duplicate_policy(policy)
+      policy.is_a?(String) ? policy.to_sym : policy
+    end
+    private :normalize_duplicate_policy
+
+    def resolve_duplicate_header(name, values, policy)
+      return [[name, values.first]] if values.size == 1
+
+      policy = normalize_duplicate_policy(policy)
+      case policy
+      when :raise, :error
+        raise InvalidComponentError,
+          "duplicate header #{name.dump} is not allowed"
+      when :first, :ignore
+        [[name, values.first]]
+      when :last
+        [[name, values.last]]
+      when :all, :keep
+        values.map { |value| [name, value] }
+      when :array
+        [[name, values]]
+      when :join, :concatenate
+        [[name, values.join(', ')]]
+      else
+        if policy.respond_to?(:call)
+          result = policy.call(name, values)
+          values = Array(result)
+          values.each do |value|
+            unless value.is_a?(String)
+              raise ArgumentError,
+                "duplicate header policy must return a String or Array of Strings"
+            end
+            reject_header_line_break(name, value)
+          end
+          return values.map { |value| [name, value] }
+        end
+
+        raise ArgumentError, "invalid duplicate header policy: #{policy.inspect}"
+      end
+    end
+    private :resolve_duplicate_header
+
+    def resolve_duplicate_body(values, policy)
+      return values.first || '' if values.size <= 1
+
+      policy = normalize_duplicate_policy(policy)
+      case policy
+      when :raise, :error
+        raise InvalidComponentError,
+          "duplicate body field is not allowed"
+      when :first, :ignore
+        values.first
+      when :last
+        values.last
+      when :all, :keep, :array, :join, :concatenate
+        values.join("\r\n")
+      else
+        if policy.respond_to?(:call)
+          result = policy.call('body', values)
+          result = Array(result).join("\r\n") unless result.is_a?(String)
+          return result
+        end
+
+        raise ArgumentError, "invalid duplicate header policy: #{policy.inspect}"
+      end
+    end
+    private :resolve_duplicate_body
   end
 
   register_scheme 'MAILTO', MailTo

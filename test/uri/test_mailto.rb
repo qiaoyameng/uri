@@ -253,6 +253,145 @@ class URI::TestMailTo < Test::Unit::TestCase
       u.to_mailtext
   end
 
+  def test_compose_fields
+    uri = URI.parse(
+      'mailto:' \
+      '%22Doe%2C%20Jane%22%20%3Cjane%2Bwork@example.com%3E,jim%2Blist@example.com' \
+      '?to=John%20%22Big%22%20%3Cjohn%2Bops@example.com%3E' \
+      '&To=ken%2Bteam@example.com' \
+      '&SuBjEcT=Project%20A%2BB' \
+      '&subject=Project%20B' \
+      '&cc=docs%2Bnotes@example.com' \
+      '&body=line1%0D%0Aline2%3A%20subject%3A%20ignored'
+    )
+
+    fields = uri.compose_fields(allowed_headers: ['Subject', 'cc'],
+                                duplicate_headers: :first)
+
+    assert_equal([
+      '"Doe, Jane" <jane+work@example.com>',
+      'jim+list@example.com',
+      'John "Big" <john+ops@example.com>',
+      'ken+team@example.com'
+    ], fields[:to])
+    assert_equal([
+      ['SuBjEcT', 'Project A+B'],
+      ['cc', 'docs+notes@example.com']
+    ], fields[:headers])
+    assert_equal("line1\r\nline2: subject: ignored", fields[:body])
+    assert_equal(
+      'mailto:%22Doe%2C%20Jane%22%20%3Cjane%2Bwork@example.com%3E,jim%2Blist@example.com' \
+      '?to=John%20%22Big%22%20%3Cjohn%2Bops@example.com%3E' \
+      '&To=ken%2Bteam@example.com' \
+      '&SuBjEcT=Project%20A%2BB' \
+      '&subject=Project%20B' \
+      '&cc=docs%2Bnotes@example.com' \
+      '&body=line1%0D%0Aline2%3A%20subject%3A%20ignored',
+      uri.to_s
+    )
+  end
+
+  def test_compose_fields_only_accepts_allowed_headers
+    uri = URI.parse('mailto:jane@example.com?subject=hello&bcc=secret@example.com')
+
+    assert_raise(URI::InvalidComponentError) do
+      uri.compose_fields
+    end
+    assert_raise(URI::InvalidComponentError) do
+      uri.compose_fields(allowed_headers: ['subject'])
+    end
+
+    subject_uri = URI.parse('mailto:jane@example.com?subject=hello')
+    assert_equal([['subject', 'hello']],
+                 subject_uri.compose_fields(allowed_headers: ['SUBJECT'])[:headers])
+    assert_equal([['subject', 'hello']],
+                 subject_uri.compose_fields(['subject'])[:headers])
+    assert_equal([['subject', 'hello']],
+                 subject_uri.compose_fields(:subject)[:headers])
+  end
+
+  def test_compose_fields_duplicate_headers
+    uri = URI.parse('mailto:jane@example.com?subject=first&SuBjEcT=second')
+
+    assert_raise(URI::InvalidComponentError) do
+      uri.compose_fields(allowed_headers: ['subject'])
+    end
+    assert_equal([['subject', 'first']],
+                 uri.compose_fields(allowed_headers: ['subject'],
+                                    duplicate_headers: :first)[:headers])
+    assert_equal([['subject', 'second']],
+                 uri.compose_fields(allowed_headers: ['subject'],
+                                    duplicate_headers: :last)[:headers])
+    assert_equal([['subject', 'first'], ['subject', 'second']],
+                 uri.compose_fields(allowed_headers: ['subject'],
+                                    duplicate_headers: :all)[:headers])
+    assert_equal([['subject', ['first', 'second']]],
+                 uri.compose_fields(allowed_headers: ['subject'],
+                                    duplicate_headers: :array)[:headers])
+    fields = uri.compose_fields(allowed_headers: ['subject']) do |_name, values|
+      values.join(' / ')
+    end
+    assert_equal([['subject', 'first / second']], fields[:headers])
+  end
+
+  def test_compose_fields_rejects_header_injection
+    invalid_uris = [
+      'mailto:jane@example.com?subject=a%0d%0abcc%3Asecret',
+      'mailto:jane@example.com?subject=a%0abcc%3Asecret',
+      'mailto:jane@example.com?to=a%0d%0abcc%3Asecret',
+      'mailto:jane@example.com?subject%0d=ignored',
+      'mailto:jane@example.com?subject%3A=ignored',
+      'mailto:jane@example.com?to=%2540example.com'
+    ]
+
+    invalid_uris.each do |source|
+      assert_raise(URI::InvalidComponentError, source) do
+        URI.parse(source).compose_fields(allowed_headers: ['subject'])
+      end
+    end
+
+    uri = URI.parse('mailto:jane@example.com?subject=%250d%250a')
+    assert_equal([['subject', '%0d%0a']],
+                 uri.compose_fields(allowed_headers: ['subject'])[:headers])
+
+    uri = URI.parse('mailto:jane@example.com?subject%0d=ignored')
+    field_name_test_uri = Class.new(URI::MailTo) do
+      private
+      define_method(:permitted_header_names) do |_headers|
+        ["subject\r"]
+      end
+    end.allocate
+    field_name_test_uri.instance_variable_set(:@to, uri.to)
+    field_name_test_uri.instance_variable_set(:@headers, uri.headers)
+    assert_raise(URI::InvalidComponentError) do
+      field_name_test_uri.compose_fields(allowed_headers: ['subject'])
+    end
+  end
+
+  def test_compose_fields_does_not_promote_body_headers
+    uri = URI.parse(
+      'mailto:jane@example.com?body=hello%0D%0ASubject%3A%20fake%0D%0ABcc%3A%20secret')
+
+    fields = uri.compose_fields(allowed_headers: ['subject'])
+
+    assert_equal([], fields[:headers])
+    assert_equal("hello\r\nSubject: fake\r\nBcc: secret", fields[:body])
+  end
+
+  def test_compose_fields_returns_independent_values
+    uri = URI.parse('mailto:jane%2Bwork@example.com?subject=a%2Bb&body=hello')
+    fields = uri.compose_fields(allowed_headers: ['subject'])
+
+    fields[:to] << 'changed@example.com'
+    fields[:headers][0][1] << ' changed'
+    fields[:body] << ' changed'
+
+    assert_equal('jane+work@example.com', uri.compose_fields(allowed_headers: ['subject'])[:to].first)
+    assert_equal('a%2Bb', uri.headers.assoc('subject').last)
+    assert_equal('mailto:jane%2Bwork@example.com?subject=a%2Bb&body=hello',
+                 uri.to_s)
+  end
+
   def test_select
     u = URI.parse('mailto:joe@example.com?cc=bob@example.com&body=hello')
     assert_equal(uri_to_ary(u), u.select(*u.component))
